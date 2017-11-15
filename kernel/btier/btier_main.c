@@ -197,10 +197,8 @@ static struct devicemagic *read_device_magic(struct tier_device *dev,
 		return NULL;
 	tier_file_read(dev, device, dmagic, sizeof(*dmagic), 0);
 	if (dmagic->magic != TIER_DEVICE_BIT_MAGIC) {
-		const char *devicename =
-		    dev->backdev[device]->fds->f_path.dentry->d_name.name;
 		pr_warn("read_device_magic : device %s missing magic\n",
-			  devicename);
+			dev->backdev[device]->fds->f_path.dentry->d_name.name);
 	}
 
 	return dmagic;
@@ -209,6 +207,9 @@ static struct devicemagic *read_device_magic(struct tier_device *dev,
 static void write_device_magic(struct tier_device *dev, int device)
 {
 	struct devicemagic *dmagic = dev->backdev[device]->devmagic;
+	if (dmagic->magic != TIER_DEVICE_BIT_MAGIC)
+		pr_warn("write_device_magic : device %u bad devmagic\n",
+		        device);
 	tier_file_write(dev, device, dmagic, sizeof(*dmagic), 0);
 }
 
@@ -328,6 +329,7 @@ static int tier_file_write(struct tier_device *dev, unsigned int device,
 	ssize_t bw;
 	mm_segment_t old_fs = get_fs();
 	struct backing_device *backdev = dev->backdev[device];
+	struct devicemagic *dmagic;
 
 	set_fs(get_ds());
 	set_debug_info(dev, VFSWRITE);
@@ -339,6 +341,15 @@ static int tier_file_write(struct tier_device *dev, unsigned int device,
 	 * synchronized with actual device.
 	 */
 	// backdev->dirty = 1;
+
+	// verify magic is still intact
+	dmagic = read_device_magic(dev, device, NULL);
+	if (dmagic != NULL && dmagic->magic != TIER_DEVICE_BIT_MAGIC) {
+		pr_err("Magic missing on device %u after writing at "
+		       "offset %llu, length %llu\n", device,
+		       (unsigned long long)pos, (unsigned long long)len);
+	}
+	kfree(dmagic);
 
 	set_fs(old_fs);
 	if (likely(bw == len))
