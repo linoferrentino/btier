@@ -579,6 +579,7 @@ static void tiered_dev_access(struct tier_device *dev, struct bio_task *bt)
 				 * need more error handling here.
 				 */
 				bio_endio(bt->parent_bio);
+				mutex_unlock(dev->block_lock + cur_blk);
 				goto bio_done;
 			}
 		}
