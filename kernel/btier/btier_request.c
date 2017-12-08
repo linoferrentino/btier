@@ -349,10 +349,10 @@ void tier_discard(struct tier_device *dev, u64 offset, unsigned int size)
 		return;
 
 	for (blocknr = start; blocknr < lastblocknr; blocknr++) {
-		mutex_lock(dev->block_lock + blocknr);
+		down_write(dev->block_lock + blocknr);
 		binfo = get_blockinfo(dev, blocknr, 0);
 		if (dev->inerror) {
-			mutex_unlock(dev->block_lock + blocknr);
+			up_write(dev->block_lock + blocknr);
 			break;
 		}
 		if (binfo->device != 0) {
@@ -365,7 +365,7 @@ void tier_discard(struct tier_device *dev, u64 offset, unsigned int size)
 			memset(binfo, 0, sizeof(struct blockinfo));
 			write_blocklist(dev, blocknr, binfo, WD);
 		}
-		mutex_unlock(dev->block_lock + blocknr);
+		up_write(dev->block_lock + blocknr);
 
 		/* in case it's a huge discard */
 		cond_resched();
@@ -542,51 +542,55 @@ static void tiered_dev_access(struct tier_device *dev, struct bio_task *bt)
 		determine_iotype(bt, cur_blk);
 		increase_iostats(bt);
 
-		mutex_lock(dev->block_lock + cur_blk);
-
-		if (rw)
+		if (rw) {
+			down_write(dev->block_lock + cur_blk);
 			binfo = get_blockinfo(dev, cur_blk, TIERWRITE);
-		else
+
+			/* write unallocated space, allocate a new block */
+			if (binfo->device == 0) {
+				tier_dev_allocate(dev, cur_blk, binfo, bt);
+
+				if (0 == binfo->device) {
+					/*
+					 * couldn't allocate, error.
+					 * need more error handling here.
+					 */
+					bio_endio(bt->parent_bio);
+					up_write(dev->block_lock + cur_blk);
+					goto bio_done;
+				}
+			}
+		} else {
+			down_read(dev->block_lock + cur_blk);
 			binfo = get_blockinfo(dev, cur_blk, TIERREAD);
 
-		/* read unallocated block, return data zero */
-		if (unlikely(!rw && 0 == binfo->device)) {
+			/* read unallocated block, return data zero */
+			if (unlikely(binfo->device == 0)) {
+				up_read(dev->block_lock + cur_blk);
 
-			mutex_unlock(dev->block_lock + cur_blk);
+				bio_fill_zero(bio, size_in_blk);
 
-			bio_fill_zero(bio, size_in_blk);
+				bio_advance(bio, size_in_blk);
 
-			bio_advance(bio, size_in_blk);
-
-			/* total splits is 0 and it's now last blk of bio.*/
-			if (1 == atomic_read(&bio->__bi_remaining) &&
-			    cur_blk == end_blk) {
-				bio_endio(bt->parent_bio);
-				goto bio_done;
-			}
-
-			/* total splits > 0 and it's now last blk of bio */
-			if (atomic_read(&bio->__bi_remaining) > 1 &&
-			    cur_blk == end_blk) {
-				atomic_dec(&bio->__bi_remaining);
-				goto bio_submitted_lastbio;
-			}
-
-			continue;
-		}
-
-		/* write unallocated space, allocate a new block */
-		if (rw && 0 == binfo->device) {
-			tier_dev_allocate(dev, cur_blk, binfo, bt);
-
-			if (0 == binfo->device) {
 				/*
-				 * couldn't allocate, error.
-				 * need more error handling here.
+				 * total splits is 0 and it's now last blk
+				 * of bio.
 				 */
-				bio_endio(bt->parent_bio);
-				mutex_unlock(dev->block_lock + cur_blk);
-				goto bio_done;
+				if (1 == atomic_read(&bio->__bi_remaining) &&
+				    cur_blk == end_blk) {
+					bio_endio(bt->parent_bio);
+					goto bio_done;
+				}
+				/*
+				 * total splits > 0 and it's now last blk
+				 * of bio
+				 */
+				if (atomic_read(&bio->__bi_remaining) > 1 &&
+				    cur_blk == end_blk) {
+					atomic_dec(&bio->__bi_remaining);
+					goto bio_submitted_lastbio;
+				}
+				continue;
 			}
 		}
 
@@ -606,7 +610,11 @@ static void tiered_dev_access(struct tier_device *dev, struct bio_task *bt)
 			if (1 == atomic_read(&bio->__bi_remaining) &&
 			    cur_blk == end_blk && cur_chunk == size_in_blk) {
 				start = (binfo->offset + offset_in_blk) >> 9;
-				mutex_unlock(dev->block_lock + cur_blk);
+				if (rw)
+				    up_write(dev->block_lock + cur_blk);
+				else
+				    up_read(dev->block_lock + cur_blk);
+
 				tier_submit_bio(dev, device, bio, start);
 				goto bio_submitted_lastbio;
 			}
@@ -617,7 +625,11 @@ static void tiered_dev_access(struct tier_device *dev, struct bio_task *bt)
 				BUG_ON(cur_blk != end_blk);
 				start =
 				    (binfo->offset + offset_in_blk + done) >> 9;
-				mutex_unlock(dev->block_lock + cur_blk);
+				if (rw)
+				    up_write(dev->block_lock + cur_blk);
+				else
+				    up_read(dev->block_lock + cur_blk);
+
 				tier_submit_bio(dev, device, bio, start);
 				goto bio_submitted_lastbio;
 			} else {
@@ -631,7 +643,10 @@ static void tiered_dev_access(struct tier_device *dev, struct bio_task *bt)
 		} while (done != size_in_blk);
 
 		/* splitting in current block is done, go to next block.*/
-		mutex_unlock(dev->block_lock + cur_blk);
+		if (rw)
+		    up_write(dev->block_lock + cur_blk);
+		else
+		    up_read(dev->block_lock + cur_blk);
 	}
 
 	return;

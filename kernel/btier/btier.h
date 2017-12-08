@@ -296,7 +296,7 @@ struct tier_device {
 	u64 size;
 	u64 blocklistsize;
 	/* block lock for per block meta data*/
-	struct mutex *block_lock;
+	struct rw_semaphore *block_lock;
 	spinlock_t dbg_lock;
 
 	struct gendisk *gd;

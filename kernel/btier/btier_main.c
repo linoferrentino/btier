@@ -1621,7 +1621,7 @@ static int alloc_blocklock(struct tier_device *dev)
 	unsigned int size;
 	u64 i, blocks = dev->size >> BLK_SHIFT;
 
-	size = blocks * sizeof(struct mutex);
+	size = blocks * sizeof(struct rw_semaphore);
 
 	dev->block_lock = vzalloc(size);
 
@@ -1629,7 +1629,7 @@ static int alloc_blocklock(struct tier_device *dev)
 		return -ENOMEM;
 
 	for (i = 0; i < blocks; i++) {
-		mutex_init(dev->block_lock + i);
+		init_rwsem(dev->block_lock + i);
 	}
 
 	return 0;
@@ -1637,14 +1637,8 @@ static int alloc_blocklock(struct tier_device *dev)
 
 static void free_blocklock(struct tier_device *dev)
 {
-	u64 i, blocks = dev->size >> BLK_SHIFT;
-
 	if (!dev->block_lock)
 		return;
-
-	for (i = 0; i < blocks; i++) {
-		mutex_destroy(dev->block_lock + i);
-	}
 
 	vfree(dev->block_lock);
 	dev->block_lock = NULL;
