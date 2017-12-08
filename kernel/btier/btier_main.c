@@ -156,6 +156,7 @@ void btier_clear_statistics(struct tier_device *dev)
 {
 	u64 curblock;
 	u64 blocks = dev->size >> BLK_SHIFT;
+	struct backing_device *backdev;
 	struct devicemagic *dmagic;
 	int i;
 	struct blockinfo *binfo = NULL;
@@ -174,11 +175,14 @@ void btier_clear_statistics(struct tier_device *dev)
 		}
 	}
 	for (i = 0; i < dev->attached_devices; i++) {
-		dmagic = dev->backdev[i]->devmagic;
+		backdev = dev->backdev[i];
+		dmagic = backdev->devmagic;
+		spin_lock(&backdev->magic_lock);
 		dmagic->average_reads = 0;
 		dmagic->average_writes = 0;
 		dmagic->total_reads = 0;
 		dmagic->total_writes = 0;
+		spin_unlock(&backdev->magic_lock);
 	}
 	btier_unlock(dev);
 }
@@ -211,7 +215,19 @@ static void write_device_magic(struct tier_device *dev, int device)
 {
 	int res;
 	struct backing_device *backdev = dev->backdev[device];
-	struct devicemagic *dmagic = backdev->devmagic;
+	struct devicemagic *dmagic;
+
+	/* Make copy rather than hold spinlock over write */
+	dmagic = kzalloc(sizeof(*dmagic), GFP_NOFS);
+	if (dmagic == NULL) {
+		pr_err("write_device_magic : unable to alloc magic buf for "
+			 "device %u\n", device);
+		return;
+	}
+	spin_lock(&backdev->magic_lock);
+	memcpy(dmagic, backdev->devmagic, sizeof(*dmagic));
+	spin_unlock(&backdev->magic_lock);
+
 	if (dmagic->magic != TIER_DEVICE_BIT_MAGIC)
 		pr_warn("write_device_magic : device %u bad devmagic\n",
 		        device);
@@ -223,16 +239,21 @@ static void write_device_magic(struct tier_device *dev, int device)
 	if (res != 0)
 		pr_err("write_device_magic : unable to sync magic for "
 			 "device %u\n", device);
+
+	kfree(dmagic);
 }
 
 static void mark_device_clean(struct tier_device *dev, int device)
 {
 	struct backing_device *backdev = dev->backdev[device];
+
+	spin_lock(&backdev->magic_lock);
 	backdev->devmagic->clean = CLEAN;
 	memset(&backdev->devmagic->binfo_journal_new, 0,
 	       sizeof(struct physical_blockinfo));
 	memset(&backdev->devmagic->binfo_journal_old, 0,
 	       sizeof(struct physical_blockinfo));
+	spin_unlock(&backdev->magic_lock);
 	write_device_magic(dev, device);
 }
 
@@ -352,6 +373,14 @@ static int tier_file_write(struct tier_device *dev, unsigned int device,
 	 * synchronized with actual device.
 	 */
 	// backdev->dirty = 1;
+	if (unlikely(pos == 0)) {
+		struct devicemagic *dmagic = buf;
+
+		if (len != sizeof(*dmagic) ||
+		    dmagic->magic != TIER_DEVICE_BIT_MAGIC)
+			pr_warn("tier_file_write : invalid magic for "
+			    "device %u\n", device);
+	}
 
 	set_fs(old_fs);
 	if (likely(bw == len))
@@ -569,23 +598,29 @@ static void write_blocklist_journal(struct tier_device *dev, u64 blocknr,
 				    struct blockinfo *olddevice)
 {
 	int device = olddevice->device - 1;
-	struct devicemagic *olddev_magic = dev->backdev[device]->devmagic;
+	struct backing_device *backdev = dev->backdev[device];
+	struct devicemagic *olddev_magic = backdev->devmagic;
 
+	spin_lock(&dev->backdev[device]->magic_lock);
 	copy_blockinfo(&olddev_magic->binfo_journal_old, olddevice);
 	copy_blockinfo(&olddev_magic->binfo_journal_new, newdevice);
 	olddev_magic->blocknr_journal = blocknr;
+	spin_unlock(&backdev->magic_lock);
 	write_device_magic(dev, device);
 }
 
 static void clean_blocklist_journal(struct tier_device *dev, int device)
 {
-	struct devicemagic *devmagic = dev->backdev[device]->devmagic;
+	struct backing_device *backdev = dev->backdev[device];
+	struct devicemagic *devmagic = backdev->devmagic;
 
+	spin_lock(&backdev->magic_lock);
 	memset(&devmagic->binfo_journal_old, 0,
 	       sizeof(struct physical_blockinfo));
 	memset(&devmagic->binfo_journal_new, 0,
 	       sizeof(struct physical_blockinfo));
 	devmagic->blocknr_journal = 0;
+	spin_unlock(&backdev->magic_lock);
 	write_device_magic(dev, device);
 }
 
@@ -596,7 +631,6 @@ static void recover_journal(struct tier_device *dev, int device)
 	struct devicemagic *devmagic = backdev->devmagic;
 	struct blockinfo binfo;
 
-	tier_file_read(dev, device, devmagic, sizeof(*devmagic), 0);
 	if (0 == devmagic->binfo_journal_old.device) {
 		pr_info(
 		    "recover_journal : journal is clean, no need to recover\n");
@@ -788,6 +822,7 @@ static int migrate_up_ifneeded(struct tier_device *dev, struct blockinfo *binfo,
 	u64 avghitcount = 0;
 	u64 avghitcountnexttier = 0;
 	u64 hysteresis;
+	struct backing_device *backdev;
 	struct devicemagic *dmagic;
 
 	if (!binfo)
@@ -803,14 +838,20 @@ static int migrate_up_ifneeded(struct tier_device *dev, struct blockinfo *binfo,
 	memcpy(orgbinfo, binfo, sizeof(struct blockinfo));
 
 	hitcount = binfo->readcount + binfo->writecount;
-	dmagic = dev->backdev[binfo->device - 1]->devmagic;
+	backdev = dev->backdev[binfo->device - 1];
+	dmagic = backdev->devmagic;
+	spin_lock(&backdev->magic_lock);
 	avghitcount = dmagic->average_reads + dmagic->average_writes;
+	spin_unlock(&backdev->magic_lock);
 	if (hitcount >
 	    avghitcount + (btier_div(avghitcount, dev->attached_devices))) {
 		if (binfo->device > 1) {
-			dmagic = dev->backdev[binfo->device - 2]->devmagic;
+			backdev = dev->backdev[binfo->device - 2];
+			dmagic = backdev->devmagic;
+			spin_lock(&backdev->magic_lock);
 			avghitcountnexttier =
 			    dmagic->average_reads + dmagic->average_writes;
+			spin_unlock(&backdev->magic_lock);
 			/* Hard coded hysteresis, maybe change this later
 			 * so that it can be adjusted via sysfs
 			 * Migrate up when the chunk is used more frequently
@@ -1425,86 +1466,68 @@ char *btier_uuid(struct tier_device *dev)
 
 static int order_devices(struct tier_device *dev)
 {
-	int swap = 0;
 	int i;
-	int newnr;
 	int clean = 1;
-	struct backing_device *backdev;
 	struct data_policy *dtapolicy;
 	char *zhash, *uuid;
 	const char *devicename;
-	struct devicemagic *devmagic;
+	struct backing_device *backdev;
 	struct block_device *bdev = NULL;
-	int res = -ENOMEM;
 
 	zhash = kzalloc(TIGER_HASH_LEN, GFP_KERNEL);
-	if (!zhash) {
-		tiererror(dev, "order_devices : alloc failed");
-		return res;
-	}
-	backdev = kzalloc(sizeof(*backdev), GFP_KERNEL);
-	if (!backdev) {
-		tiererror(dev, "order_devices : alloc failed");
-		goto end_error;
-	}
 
 	/* Allocate and load */
 	for (i = 0; i < dev->attached_devices; i++) {
-		dev->backdev[i]->devmagic = read_device_magic(dev, i, NULL);
-		spin_lock_init(&dev->backdev[i]->magic_lock);
-		spin_lock_init(&dev->backdev[i]->dev_alloc_lock);
-		if (!dev->backdev[i]->devmagic) {
-			tiererror(dev, "order_devices : alloc failed");
-			goto end_error;
-		}
-		if (i != dev->backdev[i]->devmagic->device)
-			swap = 1;
+		backdev = dev->backdev[i];
+		backdev->devmagic =
+		    kzalloc(sizeof(*backdev->devmagic), GFP_KERNEL);
+		read_device_magic(dev, i, backdev->devmagic);
+		spin_lock_init(&backdev->magic_lock);
+		spin_lock_init(&backdev->dev_alloc_lock);
 	}
 
 	/* Check and swap */
-	if (swap) {
-		devmagic = kzalloc(sizeof(struct devicemagic), GFP_KERNEL);
-		for (i = 0; i < dev->attached_devices; i++) {
-			read_device_magic(dev, i, devmagic);
-			newnr = devmagic->device;
-			if (i != newnr) {
-				memcpy(backdev, dev->backdev[i],
-				       sizeof(struct backing_device));
-				memcpy(dev->backdev[i], dev->backdev[newnr],
-				       sizeof(struct backing_device));
-				memcpy(dev->backdev[newnr], backdev,
-				       sizeof(struct backing_device));
-			}
+	for (i = 0; i < dev->attached_devices; i++) {
+		backdev = dev->backdev[i];
+		if (i != backdev->devmagic->device) {
+			struct backing_device *olddev;
+			int newnr;
+
+			newnr = backdev->devmagic->device;
+			olddev = dev->backdev[newnr];
+			dev->backdev[newnr] = backdev;
+			dev->backdev[i] = olddev;
 		}
-		kfree(devmagic);
 	}
+
 	/* Mark as inuse */
 	for (i = 0; i < dev->attached_devices; i++) {
-		if (CLEAN != dev->backdev[i]->devmagic->clean) {
+		backdev = dev->backdev[i];
+		if (CLEAN != backdev->devmagic->clean) {
 			tier_check(dev, i);
 			clean = 0;
 		}
 		uuid = btier_uuid(dev);
-		if (0 == memcmp(dev->backdev[i]->devmagic->uuid, zhash,
+		if (0 == memcmp(backdev->devmagic->uuid, zhash,
 				TIGER_HASH_LEN))
-			memcpy(dev->backdev[i]->devmagic->uuid, uuid,
+			memcpy(backdev->devmagic->uuid, uuid,
 			       TIGER_HASH_LEN);
 		kfree(uuid);
-		dev->backdev[i]->devmagic->clean = DIRTY;
+		backdev->devmagic->clean = DIRTY;
 		write_device_magic(dev, i);
-		dtapolicy = &dev->backdev[i]->devmagic->dtapolicy;
-		devicename = dev->backdev[i]->fds->f_path.dentry->d_name.name;
+		dtapolicy = &backdev->devmagic->dtapolicy;
+		devicename = backdev->fds->f_path.dentry->d_name.name;
 		pr_info("device %s registered as tier %u\n", devicename, i);
 		if (0 == dtapolicy->max_age)
 			dtapolicy->max_age = TIERMAXAGE;
 		if (0 == dtapolicy->hit_collecttime)
 			dtapolicy->hit_collecttime = TIERHITCOLLECTTIME;
-		bdev = lookup_bdev(dev->backdev[i]->devmagic->fullpathname);
+		bdev = lookup_bdev(backdev->devmagic->fullpathname);
 		if (IS_ERR(bdev)) {
-			dev->backdev[i]->bdev = NULL;
+			backdev->bdev = NULL;
 			pr_info("device %s is a file\n", devicename);
 		} else {
-			dev->backdev[i]->bdev = bdev;
+			backdev->bdev = bdev;
 			pr_info("device %s is a real device\n", devicename);
 		}
 	}
@@ -1516,16 +1539,8 @@ static int order_devices(struct tier_device *dev)
 
 	if (!clean)
 		repair_bitlists(dev);
-	kfree(backdev);
 	kfree(zhash);
 	return 0;
-
-end_error:
-	if (backdev)
-		kfree(backdev);
-	if (zhash)
-		kfree(zhash);
-	return res;
 }
 
 static int alloc_moving_bio(struct tier_device *dev)
@@ -1545,7 +1560,11 @@ static int alloc_moving_bio(struct tier_device *dev)
 
 	for (bv = 0; bv < bvecs; bv++) {
 		page = alloc_page(GFP_NOIO);
-		if (!page) {
+		if (page == NULL) {
+			while (bv > 0) {
+				bv--;
+				__free_page(bio->bi_io_vec[bv].bv_page);
+			}
 			tiererror(dev, "alloc_moving_bio: alloc_page failed\n");
 			return -ENOMEM;
 		}
@@ -2120,8 +2139,10 @@ static int migrate_blocklist(struct tier_device *dev, u64 newstartofblocklist,
 	dev->blocklistsize = newblocklistsize;
 	backdev0->startofblocklist = newstartofblocklist;
 	backdev0->endofdata = newstartofblocklist - 1;
+	spin_lock(&backdev0->magic_lock);
 	backdev0->devmagic->blocklistsize = newblocklistsize;
 	backdev0->devmagic->startofblocklist = newstartofblocklist;
+	spin_unlock(&backdev0->magic_lock);
 	return res;
 }
 
@@ -2252,7 +2273,9 @@ static int do_resize_tier(struct tier_device *dev, int devicenr, u64 newdevsize,
 	}
 
 	backdev->devicesize = newdevsize;
+	spin_lock(&backdev->magic_lock);
 	backdev->devmagic->devicesize = newdevsize;
+	spin_unlock(&backdev->magic_lock);
 	write_device_magic(dev, devicenr);
 	res = tier_sync(dev);
 	return res;
@@ -2343,8 +2366,6 @@ static long tier_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	switch (cmd) {
 	case TIER_INIT:
 		err = -ENOMEM;
-		if (sizeof(struct tier_device) > TIER_HEADERSIZE)
-			break;
 		devnew = kzalloc(sizeof(struct tier_device), GFP_KERNEL);
 		if (!devnew)
 			break;
