@@ -227,7 +227,7 @@ static int binfo_sanity(struct tier_device *dev, struct blockinfo *binfo)
 		return 0;
 	}
 
-	if (binfo->offset > backdev->devicesize) {
+	if (binfo->offset == 0 || binfo->offset > backdev->devicesize) {
 		pr_info("Metadata corruption detected : device %u, offset "
 			"%llu, devsize %llu\n",
 			binfo->device, binfo->offset, backdev->devicesize);
