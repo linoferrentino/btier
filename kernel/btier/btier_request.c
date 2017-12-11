@@ -526,6 +526,12 @@ static void tiered_dev_access(struct tier_device *dev, struct bio_task *bt)
 
 	end_blk = ((bio_end_sector(bio) - 1) << 9) >> BLK_SHIFT;
 
+	/* bounds check */
+	if (end_blk >= dev->size >> BLK_SHIFT) {
+		bio_endio(bt->parent_bio);
+		goto bio_done;
+	}
+
 	while (cur_blk <= end_blk) {
 		offset = bio->bi_iter.bi_sector << 9;
 		cur_blk = offset >> BLK_SHIFT;
