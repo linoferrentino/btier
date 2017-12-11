@@ -761,6 +761,8 @@ void reset_counters_on_migration(struct tier_device *dev,
  * and MLC SSD's and store chunks with high read and
  * low write frequency on MLC SSD. And chunks that
  * are often re-written on SLC SSD.
+
+ * Return : 0 on success, < 0 on error
  */
 static int copyblock(struct tier_device *dev, struct blockinfo *newdevice,
 		     struct blockinfo *olddevice, u64 curblock)
@@ -782,19 +784,21 @@ static int copyblock(struct tier_device *dev, struct blockinfo *newdevice,
 		pr_err("copyblock : refuse to migrate block to current device "
 		       "%u -> %u\n",
 		       newdevice->device, olddevice->device);
-		return 0;
+		return -EEXIST;
 	}
 
 	allocate_dev(dev, curblock, newdevice, devicenr);
 
 	/* No space on the device to copy to is not an error */
 	if (0 == newdevice->device)
-		return 0;
+		return -ENOSPC;
 
 	/* the actual data moving */
 	res = tier_moving_block(dev, olddevice, newdevice);
-	if (res != 0)
-		goto end_error;
+	if (res != 0) {
+		pr_err("copyblock: read/write failed, cancelling operation\n");
+		return res;
+	}
 
 	write_blocklist_journal(dev, curblock, newdevice, olddevice);
 	write_blocklist(dev, curblock, newdevice, WA);
@@ -806,10 +810,6 @@ static int copyblock(struct tier_device *dev, struct blockinfo *newdevice,
 			"%u-%llu\n",
 			curblock, olddevice->device - 1, olddevice->offset,
 			newdevice->device - 1, newdevice->offset);
-	return 1;
-
-end_error:
-	pr_err("copyblock: read failed, cancelling operation\n");
 	return 0;
 }
 
@@ -866,7 +866,8 @@ static int migrate_up_ifneeded(struct tier_device *dev, struct blockinfo *binfo,
 	}
 	if (orgbinfo->device != binfo->device) {
 		res = copyblock(dev, binfo, orgbinfo, curblock);
-		if (res) {
+		if (res == 0) {
+			res = 1;
 			reset_counters_on_migration(dev, orgbinfo);
 			clear_dev_list(dev, orgbinfo);
 			discard_on_real_device(dev, orgbinfo);
@@ -888,9 +889,11 @@ static int migrate_down_ifneeded(struct tier_device *dev,
 	u64 hitcount = 0;
 	u64 avghitcount = 0;
 	u64 hysteresis;
-	struct backing_device *backdev = dev->backdev[binfo->device - 1];
-	struct devicemagic *dmagic = backdev->devmagic;
+	struct backing_device *backdev;
+	struct devicemagic *dmagic;
 
+	if (!binfo)
+		return res;
 	if (binfo->device == 0)
 		return res;
 
@@ -902,23 +905,28 @@ static int migrate_down_ifneeded(struct tier_device *dev,
 	memcpy(orgbinfo, binfo, sizeof(struct blockinfo));
 
 	hitcount = binfo->readcount + binfo->writecount;
+	backdev = dev->backdev[binfo->device - 1];
+	dmagic = backdev->devmagic;
+	spin_lock(&backdev->magic_lock);
 	avghitcount = dmagic->average_reads + dmagic->average_writes;
 	/* Check if the block has been unused long enough that it may
 	 * be moved to a lower tier
 	 */
 	hysteresis = btier_div(avghitcount, dev->attached_devices);
-	if (curseconds - binfo->lastused > backdev->devmagic->dtapolicy.max_age)
+	if (curseconds - binfo->lastused > dmagic->dtapolicy.max_age)
 		binfo->device++;
 	else if (hitcount < avghitcount - hysteresis &&
 		 curseconds - binfo->lastused >
-		     backdev->devmagic->dtapolicy.hit_collecttime)
+		     dmagic->dtapolicy.hit_collecttime)
 		if (binfo->device < dev->attached_devices - 1)
 			binfo->device++;
+	spin_unlock(&backdev->magic_lock);
 	if (binfo->device > dev->attached_devices) {
 		binfo->device = orgbinfo->device;
 	} else if (orgbinfo->device != binfo->device) {
 		res = copyblock(dev, binfo, orgbinfo, curblock);
-		if (res) {
+		if (res == 0) {
+			res = 1;
 			reset_counters_on_migration(dev, orgbinfo);
 			clear_dev_list(dev, orgbinfo);
 			discard_on_real_device(dev, orgbinfo);
@@ -1055,6 +1063,7 @@ static void walk_blocklist(struct tier_device *dev)
 	struct backing_device *backdev;
 	struct data_policy *dtapolicy = &dev->backdev[0]->devmagic->dtapolicy;
 
+	btier_lock(dev);
 	if (dev->migrate_verbose)
 		pr_info("walk_blocklist start from : %llu\n",
 			dev->resumeblockwalk);
@@ -1072,25 +1081,31 @@ static void walk_blocklist(struct tier_device *dev)
 		if (binfo->device != 0) {
 			backdev = dev->backdev[binfo->device - 1];
 			devblocks = backdev->devicesize >> BLK_SHIFT;
+			spin_lock(&backdev->magic_lock);
 			backdev->devmagic->average_reads = btier_div(
 			    backdev->devmagic->total_reads, devblocks);
 			backdev->devmagic->average_writes = btier_div(
 			    backdev->devmagic->total_writes, devblocks);
+			spin_unlock(&backdev->magic_lock);
 			res = migrate_down_ifneeded(dev, binfo, curblock);
-			if (!res)
+			if (res == 0)
 				res = migrate_up_ifneeded(dev, binfo, curblock);
-			if (!res) {
+			if (res == 0) {
 				if (binfo->readcount >= MAX_STAT_COUNT) {
 					binfo->readcount -= MAX_STAT_DECAY;
+					spin_lock(&backdev->magic_lock);
 					backdev->devmagic->total_reads -=
 					    MAX_STAT_DECAY;
+					spin_unlock(&backdev->magic_lock);
 					(void)write_blocklist(dev, curblock,
 							      binfo, WC);
 				}
 				if (binfo->writecount >= MAX_STAT_COUNT) {
 					binfo->writecount -= MAX_STAT_DECAY;
+					spin_lock(&backdev->magic_lock);
 					backdev->devmagic->total_writes -=
 					    MAX_STAT_DECAY;
+					spin_unlock(&backdev->magic_lock);
 					(void)write_blocklist(dev, curblock,
 							      binfo, WC);
 				}
@@ -1109,8 +1124,10 @@ static void walk_blocklist(struct tier_device *dev)
 			}
 		}
 	}
-	if (dev->inerror)
+	if (dev->inerror) {
+		btier_unlock(dev);
 		return;
+	}
 	tier_sync(dev);
 	if (!interrupted) {
 		dev->resumeblockwalk = 0;
@@ -1122,6 +1139,8 @@ static void walk_blocklist(struct tier_device *dev)
 	}
 	if (!dev->stop && !dtapolicy->migration_disabled)
 		add_timer(&dev->migrate_timer);
+
+	btier_unlock(dev);
 }
 
 void do_migrate_direct(struct tier_device *dev)
@@ -1163,15 +1182,16 @@ void do_migrate_direct(struct tier_device *dev)
 	binfo->device = newdevice + 1;
 
 	res = copyblock(dev, binfo, orgbinfo, blocknr);
-	if (res) {
+	if (res == 0) {
 		reset_counters_on_migration(dev, orgbinfo);
 		clear_dev_list(dev, orgbinfo);
 		discard_on_real_device(dev, orgbinfo);
 	} else {
-		pr_err("copyblock failed\n");
-		memcpy(binfo, orgbinfo, sizeof(struct blockinfo));
+		pr_err("Failed to migrate blocknr %llu "
+		       "from device %u to device %u: %d\n",
+		       blocknr, orgbinfo->device - 1,
+		       binfo->device - 1, res);
 	}
-	kfree(orgbinfo);
 end_error:
 	btier_unlock(dev);
 }
@@ -1213,9 +1233,7 @@ static void data_migrator(struct work_struct *work)
 			atomic_set(&dev->migrate, 0);
 			continue;
 		}
-		btier_lock(dev);
 		walk_blocklist(dev);
-		btier_unlock(dev);
 		if (dev->migrate_verbose)
 			pr_info("data_migrator goes back to sleep\n");
 	}
@@ -2195,14 +2213,15 @@ static int migrate_data_if_needed(struct tier_device *dev, u64 startofblocklist,
 				curblock, orgbinfo->device - 1,
 				binfo->device - 1);
 			cbres = copyblock(dev, binfo, orgbinfo, curblock);
-			if (cbres) {
+			if (cbres == 0) {
 				reset_counters_on_migration(dev, orgbinfo);
 				clear_dev_list(dev, orgbinfo);
+				discard_on_real_device(dev, orgbinfo);
 			} else
-				pr_info("Failed to migrate blocknr %llu from "
-					"device %u to device %u\n",
-					curblock, orgbinfo->device - 1,
-					binfo->device - 1);
+				pr_err("Failed to migrate blocknr %llu "
+				       "from device %u to device %u: %d\n",
+				       curblock, orgbinfo->device - 1,
+				       binfo->device - 1, cbres);
 		}
 		if (!cbres) {
 			res = -1;
